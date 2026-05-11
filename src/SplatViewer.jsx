@@ -2,32 +2,29 @@
 // on repeat visits creates an ObjectURL from the cached buffer and feeds
 // that directly to the viewer — zero network requests after first load.
 //
-// PATCHES applied:
-//  1. WebGL context-loss → render loop paused, viewer torn down cleanly
+// PATCHES:
+//  1. WebGL context-loss  → viewer disposed, RAF loop stopped (was crashing)
 //  2. WebGL context-restore → full re-init from IndexedDB cache (fast path)
-//  3. Crash guard: TypeError on undefined texture is now caught & recovered
-//  4. SW dual-caching note: sw.js fetch handler removed (see sw.js patch)
+//  3. All useRef calls are at component top level — fixes React error #321
 
 import { useEffect, useRef, useCallback } from 'react'
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d'
 import { getCachedModel, setCachedModel } from './useSplatCache.js'
 import { detectGPUTier, getGPUOptimizations, checkVRSupport } from './gpuUtils.js'
 
-// ── Change this to match your file in /public ──────────────────────────────
 const SPLAT_FILE = '/scene.ply'
-// ───────────────────────────────────────────────────────────────────────────
-
-// Stable IndexedDB key (origin + path, no query-string noise)
-const CACHE_KEY = `splat:${SPLAT_FILE}`
+const CACHE_KEY  = `splat:${SPLAT_FILE}`
 
 export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInfo, onReady }) {
-  const containerRef   = useRef(null)
-  const viewerRef      = useRef(null)
-  const objectUrlRef   = useRef(null)   // track so we can revoke on unmount
-  const contextLostRef = useRef(false)  // true while WebGL context is absent
-  const cancelledRef   = useRef(false)  // true after component unmount
+  // ── All refs declared at top level (Rules of Hooks) ──────────────────────
+  const containerRef        = useRef(null)
+  const viewerRef           = useRef(null)
+  const objectUrlRef        = useRef(null)
+  const cancelledRef        = useRef(false)
+  const lostListenerRef     = useRef(null)
+  const restoredListenerRef = useRef(null)
 
-  // ── Teardown ─────────────────────────────────────────────────────────────
+  // ── Teardown ──────────────────────────────────────────────────────────────
   const cleanup = useCallback(() => {
     if (viewerRef.current) {
       try { viewerRef.current.dispose() } catch {}
@@ -39,27 +36,41 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
     }
   }, [])
 
+  // ── Detach WebGL context listeners from the viewer canvas ─────────────────
+  const detachContextHandlers = useCallback(() => {
+    const canvas = containerRef.current?.querySelector('canvas')
+    if (!canvas) return
+    if (lostListenerRef.current) {
+      canvas.removeEventListener('webglcontextlost', lostListenerRef.current)
+      lostListenerRef.current = null
+    }
+    if (restoredListenerRef.current) {
+      canvas.removeEventListener('webglcontextrestored', restoredListenerRef.current)
+      restoredListenerRef.current = null
+    }
+  }, [])
+
   useEffect(() => {
     cancelledRef.current = false
 
-    // ── Core init — called on first mount AND after context restore ─────────
+    // ── init — runs on first mount and after every context restore ───────────
     async function init() {
       if (!containerRef.current || cancelledRef.current) return
 
-      // ── 1. GPU detection ────────────────────────────────────────────────
+      // 1. GPU detection
       const gpuTier = detectGPUTier()
       const opts    = getGPUOptimizations(gpuTier)
       onGPUInfo?.({ tier: gpuTier, ...opts })
       onStatus?.('Detecting capabilities...')
 
-      // ── 2. VR check ─────────────────────────────────────────────────────
+      // 2. VR check
       const vrStatus = await checkVRSupport()
       onVRStatus?.(vrStatus)
       if (cancelledRef.current) return
 
-      // ── 3. Build viewer ─────────────────────────────────────────────────
+      // 3. Build viewer
       const viewer = new GaussianSplats3D.Viewer({
-        el: containerRef.current,
+        el:                            containerRef.current,
         selfDrivenMode:                true,
         useBuiltInControls:            true,
         gpuAcceleratedSort:            opts.gpuAcceleratedSort,
@@ -69,9 +80,9 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
         antialiased:                   opts.antialias,
         devicePixelRatio:              opts.pixelRatio,
         xrEnabled:                     vrStatus.supported,
-        xrSessionInit: vrStatus.supported ? {
-          optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
-        } : undefined,
+        xrSessionInit: vrStatus.supported
+          ? { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] }
+          : undefined,
         xrReferenceSpaceType: 'local-floor',
         logLevel: GaussianSplats3D.LogLevel?.None ?? 0,
       })
@@ -79,33 +90,61 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
       if (cancelledRef.current) { viewer.dispose(); return }
       viewerRef.current = viewer
 
-      // ── 4. Attach WebGL context-loss handlers ───────────────────────────
-      //    Must be done right after viewer creation so the canvas exists.
-      attachContextHandlers(init)
+      // 4. Attach WebGL context-loss / restore handlers to the viewer canvas.
+      //    Must happen after viewer creation (canvas doesn't exist before that).
+      //    We detach any previous listeners first to avoid duplicates on re-init.
+      detachContextHandlers()
 
-      // ── 5. Try IndexedDB cache ──────────────────────────────────────────
+      const canvas = containerRef.current?.querySelector('canvas')
+      if (canvas) {
+        lostListenerRef.current = (e) => {
+          // preventDefault() is required — without it the browser never fires
+          // contextrestored and the viewer stays broken forever.
+          e.preventDefault()
+          console.warn('[SplatViewer] WebGL context lost — disposing viewer')
+          onStatus?.('GPU context lost — recovering...')
+          // Dispose cleanly so the self-driven RAF loop stops.
+          // Without this the loop keeps calling render() on invalid GPU state
+          // → the "Cannot read properties of undefined (reading 'complete')"
+          // TypeError you were seeing on every animation frame.
+          cleanup()
+        }
+
+        restoredListenerRef.current = () => {
+          console.warn('[SplatViewer] WebGL context restored — re-initialising')
+          onStatus?.('Reloading...')
+          onProgress?.(0)
+          // Re-run init. IndexedDB cache is already warm → no network fetch.
+          init().catch((err) => {
+            console.error('[SplatViewer] Re-init after context restore failed:', err)
+            onStatus?.(`Recovery failed: ${err.message}`)
+          })
+        }
+
+        canvas.addEventListener('webglcontextlost',     lostListenerRef.current,     false)
+        canvas.addEventListener('webglcontextrestored', restoredListenerRef.current, false)
+      }
+
+      // 5. Try IndexedDB cache
       onStatus?.('Checking cache...')
       let buffer = null
-
       try {
         const cached = await getCachedModel(CACHE_KEY)
         if (cached?.data instanceof ArrayBuffer && cached.data.byteLength > 0) {
           buffer = cached.data
-          console.log('[SplatViewer] Loaded from IndexedDB cache —',
+          console.log('[SplatViewer] Loaded from IndexedDB —',
             (buffer.byteLength / 1024 / 1024).toFixed(1), 'MB')
         }
       } catch (e) {
         console.warn('[SplatViewer] Cache read failed:', e)
       }
 
-      // ── 6. Fetch from /public if not cached ─────────────────────────────
+      // 6. Fetch from /public if not cached
       if (!buffer) {
         onStatus?.('Downloading model...')
         buffer = await fetchWithProgress(SPLAT_FILE, (pct) => {
-          onProgress?.(Math.round(pct * 0.80)) // 0–80 % for download
+          onProgress?.(Math.round(pct * 0.80))
         })
-
-        // Store in IndexedDB (fire-and-forget)
         onStatus?.('Caching model...')
         setCachedModel(CACHE_KEY, buffer)
           .then(() => console.log('[SplatViewer] Model cached in IndexedDB'))
@@ -116,12 +155,10 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
 
       if (cancelledRef.current) { cleanup(); return }
 
-      // ── 7. ObjectURL → viewer ───────────────────────────────────────────
+      // 7. ObjectURL → viewer
       onStatus?.('Preparing scene...')
       onProgress?.(85)
-
       const blob      = new Blob([buffer], { type: 'application/octet-stream' })
-      // Append #scene.ply so sceneFormatFromPath() infers the .ply format
       const objectUrl = URL.createObjectURL(blob) + '#scene.ply'
       objectUrlRef.current = objectUrl
 
@@ -134,7 +171,7 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
         showLoadingUI:              false,
         progressiveLoad:            false,
         onProgress: (pct) => {
-          onProgress?.(85 + Math.round(pct * 0.15)) // 85–100 %
+          onProgress?.(85 + Math.round(pct * 0.15))
         },
       })
 
@@ -146,70 +183,15 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
       viewer.start()
     }
 
-    // ── WebGL context-loss / restore ──────────────────────────────────────
-    //
-    // Strategy:
-    //   • contextlost  → preventDefault() (required for restore to fire),
-    //                    stop the render loop, tear down the viewer cleanly.
-    //   • contextrestored → re-run init() which hits the IndexedDB cache
-    //                       (no network hit), rebuilds the viewer from scratch.
-    //
-    // We keep refs to the listeners so we can remove them on unmount.
-    const lostListenerRef    = useRef(null)
-    const restoredListenerRef = useRef(null)
-
-    function attachContextHandlers(reinitFn) {
-      // Find the canvas the viewer created inside our container
-      const canvas = containerRef.current?.querySelector('canvas')
-      if (!canvas) return
-
-      // Detach any previous listeners to avoid duplicates on re-init
-      if (lostListenerRef.current)
-        canvas.removeEventListener('webglcontextlost', lostListenerRef.current)
-      if (restoredListenerRef.current)
-        canvas.removeEventListener('webglcontextrestored', restoredListenerRef.current)
-
-      lostListenerRef.current = (e) => {
-        e.preventDefault() // ← required; without this, restore never fires
-        contextLostRef.current = true
-        console.warn('[SplatViewer] WebGL context lost — tearing down viewer')
-        onStatus?.('GPU context lost — recovering...')
-        // Dispose viewer to stop the self-driven RAF loop; it would otherwise
-        // keep calling render() and crash on every frame (the bug you saw).
-        cleanup()
-      }
-
-      restoredListenerRef.current = () => {
-        contextLostRef.current = false
-        console.warn('[SplatViewer] WebGL context restored — re-initialising')
-        onStatus?.('GPU context restored — reloading...')
-        onProgress?.(0)
-        // Re-run the full init. IndexedDB cache is warm → fast path.
-        reinitFn().catch((err) => {
-          console.error('[SplatViewer] Re-init after context restore failed:', err)
-          onStatus?.(`Recovery failed: ${err.message}`)
-        })
-      }
-
-      canvas.addEventListener('webglcontextlost',     lostListenerRef.current,     false)
-      canvas.addEventListener('webglcontextrestored', restoredListenerRef.current, false)
-    }
-
     init().catch((err) => {
       console.error('[SplatViewer] Init error:', err)
       onStatus?.(`Error: ${err.message}`)
     })
 
+    // ── Cleanup on unmount ─────────────────────────────────────────────────
     return () => {
       cancelledRef.current = true
-      // Remove context listeners from the canvas before tearing down
-      const canvas = containerRef.current?.querySelector('canvas')
-      if (canvas) {
-        if (lostListenerRef.current)
-          canvas.removeEventListener('webglcontextlost', lostListenerRef.current)
-        if (restoredListenerRef.current)
-          canvas.removeEventListener('webglcontextrestored', restoredListenerRef.current)
-      }
+      detachContextHandlers()
       cleanup()
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -222,14 +204,12 @@ export default function SplatViewer({ onStatus, onProgress, onVRStatus, onGPUInf
   )
 }
 
-// ── Streaming fetch with progress callback ────────────────────────────────────
+// ── Streaming fetch with progress ─────────────────────────────────────────────
 async function fetchWithProgress(url, onProgress) {
   const res = await fetch(url)
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`)
 
-  const contentLength = res.headers.get('content-length')
-  const total         = contentLength ? parseInt(contentLength, 10) : 0
-
+  const total  = parseInt(res.headers.get('content-length') ?? '0', 10)
   const reader = res.body.getReader()
   const chunks = []
   let loaded   = 0
@@ -244,9 +224,6 @@ async function fetchWithProgress(url, onProgress) {
 
   const out = new Uint8Array(loaded)
   let offset = 0
-  for (const chunk of chunks) {
-    out.set(chunk, offset)
-    offset += chunk.length
-  }
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length }
   return out.buffer
 }
